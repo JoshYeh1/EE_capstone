@@ -1,4 +1,4 @@
-//STEP 2: Get the Motor to oscillate __ degree given angle input
+//STEP 2: Get the Motor to oscillate __ degree given angle input includes microstepping!
 
 const int stepX = 2;
 const int dirX = 5;
@@ -40,9 +40,12 @@ void moveSteps(int steps, bool direction) { //reasuable motion function with ste
 }
 
 void loop() {
-  moveSteps(oscillation_steps,HIGH); //Calls function and moves motor
-  delay(200);
-  moveSteps(oscillation_steps,LOW);
-  delay(200); //one second delau
+  for (int x = 0; x < 200; x++) {
+    moveSteps(oscillation_steps,HIGH); //Calls function and moves motor
+    delay(200);
+    moveSteps(oscillation_steps,LOW);
+    delay(200); //one second delau
+  }
+  delay(1000);
 }
 
