@@ -13,12 +13,12 @@ const unsigned long step_delay = 800; // changable delay in microseconds
 float oscillation_angle = 360.0; //CHANGE THIS
 int oscillation_steps; //empty var 
 
-unsigned long lastStepTime = 0;
+unsigned long lastStepTime = 0; //Stores timestamp
 bool stepState = false;// HIGH or LOW state of step pin
-bool direction = HIGH;// current direction
+bool direction = HIGH;// tracks when current direction is high or low
 
 int stepsTaken = 0;// steps completed in current move
-bool moving = true;// motor currently moving
+bool moving = true;// motor currently moving (Flag statement)
 
 void setup() {
   pinMode(stepX, OUTPUT);
@@ -35,13 +35,13 @@ void loop() {
 
   if (moving) {
 
-    if (!stepState && (currentTime - lastStepTime >= step_delay)) { //When in ste HIGH
+    if (!stepState && (currentTime - lastStepTime >= step_delay)) { //When in step LOW and if enough time has passed since last event
       digitalWrite(stepX, HIGH);
       stepState = true;
       lastStepTime = currentTime;
     }
 
-    else if (stepState && (currentTime - lastStepTime >= step_delay)) { //when in step LOW
+    else if (stepState && (currentTime - lastStepTime >= step_delay)) { //when in step HIGH
       digitalWrite(stepX, LOW);
       stepState = false;
       lastStepTime = currentTime;
