@@ -4,11 +4,11 @@ const int stepX = 2;
 const int dirX  = 5;
 const int potPin = A0;
 
-const int microstep = 1; //CHANGE THIS DEPENDING ON MICROSTEPPING
+const int microstep = 8; //CHANGE THIS DEPENDING ON MICROSTEPPING
 const int motor_steps = 200;
 const int steps_per_rev = motor_steps * microstep;
 
-const unsigned long step_delay = 800; //Adjustabe Delay
+unsigned long step_delay = 800; // variable delay
 
 unsigned long lastStepTime = 0;
 bool stepState = false;
@@ -23,19 +23,21 @@ void setup() {
 }
 
 void loop() {
+  //Read potentiometer once and smooth using low pass filter
+  static float filteredValue = 0;
+
+  int raw = analogRead(potPin);
+  filteredValue = 0.95 * filteredValue + 0.05 * raw;
 
   //Non-blocking serial print in terminal
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint > 200) {
     lastPrint = millis();
     Serial.print("Pot reading: ");
-    Serial.println(value);
+    Serial.println(raw);
   }
 
-  //Read potentiometer once
-  int potValue = analogRead(potPin);
-
-  float angle = (potValue / 1023.0) * 720.0;  // smoother than map()
+  float angle = (filteredValue / 1023.0) * 720.0;  // smoother than map()
   targetPosition = (angle / 360.0) * steps_per_rev;
 
   //Move motor
@@ -45,6 +47,12 @@ void loop() {
     digitalWrite(dirX, direction);
 
     unsigned long currentTime = micros();
+
+    long error = targetPosition - currentPosition;
+    long absError = abs(error);
+
+    step_delay = map(absError, 0, 200, 3000, 600);
+    step_delay = constrain(step_delay, 600, 3000);
 
     if (!stepState && (currentTime - lastStepTime >= step_delay)) {
       digitalWrite(stepX, HIGH);
