@@ -8,7 +8,7 @@ const int microstep = 8; //CHANGE THIS DEPENDING ON MICROSTEPPING
 const int motor_steps = 200;
 const int steps_per_rev = motor_steps * microstep;
 
-unsigned long step_delay = 800; // variable delay
+unsigned long step_delay = 1000; // variable delay
 
 unsigned long lastStepTime = 0;
 bool stepState = false;
@@ -37,11 +37,11 @@ void loop() {
     Serial.println(raw);
   }
 
-  float angle = (filteredValue / 1023.0) * 720.0;  // smoother than map()
+  float angle = (filteredValue / 1023.0) * 270.0;  // smoother than map()
   targetPosition = (angle / 360.0) * steps_per_rev;
 
   //Move motor
-  if (abs(currentPosition - targetPosition) > 5) {
+  if (abs(currentPosition - targetPosition) > 2) {
 
     bool direction = (targetPosition > currentPosition);
     digitalWrite(dirX, direction);
@@ -51,8 +51,10 @@ void loop() {
     long error = targetPosition - currentPosition;
     long absError = abs(error);
 
-    step_delay = map(absError, 0, 200, 3000, 600);
-    step_delay = constrain(step_delay, 600, 3000);
+    step_delay = map(absError, 0, 3000, 1500, 150);
+    step_delay = constrain(step_delay, 150, 1500);
+
+    unsigned long pulseWidth = 5;  // 5 µs HIGH pulse
 
     if (!stepState && (currentTime - lastStepTime >= step_delay)) {
       digitalWrite(stepX, HIGH);
@@ -60,7 +62,7 @@ void loop() {
       lastStepTime = currentTime;
     }
 
-    else if (stepState && (currentTime - lastStepTime >= step_delay)) {
+    else if (stepState && (currentTime - lastStepTime >= pulseWidth)) {
       digitalWrite(stepX, LOW);
       stepState = false;
       lastStepTime = currentTime;
