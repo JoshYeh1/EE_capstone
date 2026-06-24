@@ -1,65 +1,70 @@
 // STEP 7: user input with calibration with LED for FUN NOW WITH ACCELERATION STUFF
 
+//Motor setup
 const int stepX = 2;
 const int dirX  = 5;
 
-const int potPin = A0;
+const int potPin = A0; //Analog pin on CNC shield for potentimeter (0-1023)
 
-const int zeroBtnPin = 9;// button to set zero
-const int ledPin = 10;//Fun LED pin
+const int zeroBtnPin = 9; // (D9) button to set zero
+const int ledPin = 10;// (D10) Fun LED pin
 
 //FOR SMOOOOTH ACCELERATION
-bool motionActive = false;
-long motionStartSteps = 0;
-long motionEndSteps = 0;
+bool motionActive = false; //false = idle, true = smooth acceleration
+long motionStartSteps = 0; //stores where inital position is in microsteps
+long motionEndSteps = 0; //store final position in microsteps
 unsigned long motionStartTime = 0;
-unsigned long motionDuration = 3000; 
+unsigned long motionDuration = 3000; //how long total motion should last
 
-const bool btnActiveLow = true;  // INPUT_PULLUP, when pressed = LOW
+//BUTTON config
+const bool btnActiveLow = true;  // when pressed = LOW, not pressed = HIGH
 
-const int microstep = 8;
-const int motor_steps = 200;
-const long steps_per_rev = (long)motor_steps * microstep;
+//MICROSTEPPING config
+const int microstep = 8; //====CHANGE THIS AS NEEDED====
+const int motor_steps = 200;//steps per rev
+const long steps_per_rev = (long)motor_steps * microstep;//adjusts # of steps
 
 // motion timing
-unsigned long step_delay = 800;
-unsigned long lastStepTime = 0;
-bool stepState = false;
+unsigned long step_delay = 800;//time between step pulses (ms)
+unsigned long lastStepTime = 0;//basically time.time stores inital time var
+bool stepState = false;//flag var telling us if in high or low state for PWM
 
 // position tracking
-long currentPosition = 0;   // motor position in microsteps (tracked)
-long targetPosition  = 0;   // commanded target in microsteps
+long currentPosition = 0;   //motor position in microsteps (tracked)
+long targetPosition  = 0;   //commanded target in microsteps
 
 // software zero offset (set by button)
 long zeroOffsetSteps = 0;
 
 // serial input
-String inputLine = "";
+String inputLine = "";//Stores characters typed in Serial Monitor
 
 // mode
-enum Mode { CALIBRATE_POT, RUN_SERIAL };
-Mode mode = CALIBRATE_POT;
+enum Mode { CALIBRATE_POT, RUN_SERIAL };//defines 2 operating states
+Mode mode = CALIBRATE_POT;//starts with calibration mode
 
-// ---------------- helpers ----------------
+//helpers
 bool buttonPressed() {
-  int v = digitalRead(zeroBtnPin);
-  return btnActiveLow ? (v == LOW) : (v == HIGH);
+  int v = digitalRead(zeroBtnPin);//Reads voltage on button pin
+  return btnActiveLow ? (v == LOW) : (v == HIGH);//if...else statement (if low...true, if high...false)
 }
 
 // debounced press detect (edge)
+//button/switch is not binary, there is a bounsing signal when you press it
 bool buttonRisingEdge() {
-  static bool stableState = false;         // last stable pressed/unpressed
-  static bool lastReading = false;         // last raw reading
+  static bool stableState = false;// last stable pressed/unpressed
+  static bool lastReading = false; // last raw reading
   static unsigned long lastChange = 0;
 
-  bool reading = buttonPressed();
+  bool reading = buttonPressed();//gives HIGH or LOW from above func
 
   if (reading != lastReading) {
     lastChange = millis();
     lastReading = reading;
   }
 
-  if ((millis() - lastChange) > 30) {      // debounce time
+  //waits 30 us for stability to count as "pressed"
+  if ((millis() - lastChange) > 30) {// debounce time
     if (reading != stableState) {
       stableState = reading;
       if (stableState == true) return true; // became pressed
@@ -69,10 +74,11 @@ bool buttonRisingEdge() {
   return false;
 }
 
+// this takes user angle, converts to steps,  plans motion then starts timer
 void setTargetFromAngle(float angleDeg) {
 
   long angleSteps = (long)((angleDeg / 360.0) * (float)steps_per_rev);
-  long newTarget = zeroOffsetSteps + angleSteps;
+  long newTarget = zeroOffsetSteps + angleSteps;//from set zero, add steps to get target
 
   motionStartSteps = currentPosition;
   motionEndSteps = newTarget;
@@ -80,7 +86,7 @@ void setTargetFromAngle(float angleDeg) {
   long distance = abs(motionEndSteps - motionStartSteps);
 
   // Duration proportional to move size
-  motionDuration = map(distance, 0, 4000, 500, 4000);
+  motionDuration = map(distance, 0, 4000, 500, 4000);//map(value, in_min, in_max, out_min, out_max)
   motionDuration = constrain(motionDuration, 500, 5000);
 
   motionStartTime = millis();
