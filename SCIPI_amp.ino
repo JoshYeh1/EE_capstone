@@ -1,3 +1,4 @@
+// Program uses SCIPI commands and uses three axis hall sensor to determine orientation of sample relative to mag field
 #include <math.h>
 #include <EEPROM.h>
 #include <avr/pgmspace.h>

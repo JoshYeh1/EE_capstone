@@ -23,9 +23,9 @@ const int HALL_Z_PIN = A2;
 
 const int NUM_SAMPLES = 100;
 
-const float X_OFFSET = 504.0f;
-const float Y_OFFSET = 505.0f;
-const float Z_OFFSET = 509.0f;
+const float X_OFFSET = 502.57f; 
+const float Y_OFFSET = 505.000;
+const float Z_OFFSET = 428.340;
 
 // -------------------- Structs (all declared before any function that references them) --------------------
 
@@ -65,6 +65,19 @@ struct SavedState {
   uint16_t checksum;
 };
 
+// These must be declared near the top because the Arduino IDE auto-generates
+// function prototypes before later code sections.
+struct SearchMove {
+  float dPsi;
+  float dOmega;
+};
+
+struct ClosedLoopMemory {
+  float lastDPsi;
+  float lastDOmega;
+  int noImproveCount;
+};
+
 // -------------------- Forward Declarations --------------------
 float currentPsiDeg();
 float currentOmegaDeg();
@@ -86,7 +99,18 @@ HallData readHallAverage() {
   HallData result;
   result.x = ((float)xSum / NUM_SAMPLES) - X_OFFSET;
   result.y = ((float)ySum / NUM_SAMPLES) - Y_OFFSET;
-  result.z = ((float)zSum / NUM_SAMPLES) - Z_OFFSET;
+  result.z = (((float)zSum / NUM_SAMPLES) - Z_OFFSET) * 0.94f; //CHANGED. ADDED *0.94
+
+  // Small Hall sensor mounting-tilt correction: rotate X/Z about Y axis
+  const float TILT_DEG = 4.0f;
+  const float TILT_RAD = TILT_DEG * PI / 180.0f;
+
+  float xOld = result.x;
+  float zOld = result.z;
+
+  result.x = xOld * cos(TILT_RAD) + zOld * sin(TILT_RAD);
+  result.z = -xOld * sin(TILT_RAD) + zOld * cos(TILT_RAD);
+  //END ADD
   return result;
 }
 
@@ -652,27 +676,29 @@ void moveAndMeasure(float psi, float omega, float rpm) {
 }
 
 // -------------------- Closed Loop: target Theta/Phi --------------------
-// Two-stage closed-loop search:
-// Stage 1: use PSI nudges to bring THETA near target.
-// Stage 2: keep THETA near target and use OMEGA nudges to bring PHI near target.
-// Every candidate starts from the same base point and is approached from the same
-// direction to reduce backlash/path-dependence in belts/gears.
+// Improved local-search controller:
+// - scores the current position as a baseline
+// - averages multiple Hall orientations at each tested point
+// - uses large steps far away and small steps near target
+// - requires a meaningful score improvement before moving
+// - discourages immediate reversals (helps backlash / belt slack)
+// - uses 4-point cross search first; tries diagonals only when needed
 
 const float CL_THETA_TOL_DEG = 2.0f;
 const float CL_PHI_TOL_DEG = 5.0f;
 const float CL_THETA_STAGE2_BAND_DEG = 5.0f;
 const float CL_THETA_HOLD_WEIGHT = 4.0f;
 
-const float CL_PSI_NUDGE_DEG = 2.0f;
-const float CL_OMEGA_NUDGE_DEG = 5.0f;
-const float CL_APPROACH_MARGIN_DEG = 3.0f;
-
-const int   CL_MAX_ITERATIONS = 20;
+const int CL_MAX_ITERATIONS = 20;
 const unsigned long CL_SETTLE_MS = 450UL;
+const int CL_ORIENTATION_READS = 5;       // Each read itself averages ADC samples.
+const float CL_MIN_IMPROVEMENT_FRAC = 0.03f; // Candidate must improve score by 8%.
+const float CL_MIN_IMPROVEMENT_ABS = 0.50f;  // Or at least 0.20 degree-score.
+const float CL_REVERSAL_EXTRA_FRAC = 0.15f;  // Extra improvement required to reverse.
+const float CL_APPROACH_MARGIN_DEG = 3.0f;
+const int CL_STUCK_LIMIT = 2;
 
-// If targetPhiDefined is false, PHI is intentionally ignored. This is used for
-// targets such as CL:ORIENT 0,UNDEF,2 where the field should be straight through
-// the sample and there is no meaningful in-plane direction.
+
 bool orientationAtTarget(const HallOrientation &o, float targetThetaDeg,
                          float targetPhiDeg, bool targetPhiDefined) {
   if (fabsf(o.thetaDeg - targetThetaDeg) > CL_THETA_TOL_DEG) return false;
@@ -681,56 +707,135 @@ bool orientationAtTarget(const HallOrientation &o, float targetThetaDeg,
   return o.phiDefined && (phiErrorDeg(o.phiDeg, targetPhiDeg) <= CL_PHI_TOL_DEG);
 }
 
-// Move to target so the FINAL approach is as consistent as possible.
-// Normally it approaches from below (+ direction). Near a lower limit, it uses
-// the opposite side because there is no room to come from below.
+// Average several fully computed orientations. Phi is averaged as a circular quantity.
+bool readStableOrientation(HallOrientation &out) {
+  float thetaSum = 0.0f;
+  float magSum = 0.0f;
+  float phiSinSum = 0.0f;
+  float phiCosSum = 0.0f;
+  int validCount = 0;
+  int phiCount = 0;
+
+  for (int i = 0; i < CL_ORIENTATION_READS; i++) {
+    HallOrientation one = calculateThetaPhi(readFieldVector());
+    if (!one.valid) continue;
+    thetaSum += one.thetaDeg;
+    magSum += one.magnitude;
+    validCount++;
+    if (one.phiDefined) {
+      float r = one.phiDeg * PI / 180.0f;
+      phiSinSum += sinf(r);
+      phiCosSum += cosf(r);
+      phiCount++;
+    }
+    if (i < CL_ORIENTATION_READS - 1) delay(20);
+  }
+
+  if (validCount == 0) return false;
+  out.thetaDeg = thetaSum / validCount;
+  out.magnitude = magSum / validCount;
+  out.valid = true;
+  out.phiDefined = (phiCount >= (CL_ORIENTATION_READS + 1) / 2);
+  out.phiDeg = 0.0f;
+  if (out.phiDefined) {
+    out.phiDeg = atan2f(phiSinSum, phiCosSum) * 180.0f / PI;
+    if (out.phiDeg < 0.0f) out.phiDeg += 360.0f;
+  }
+  return true;
+}
+
+float closedLoopScore(const HallOrientation &o, float targetTheta, float targetPhi,
+                      bool thetaStage) {
+  float thetaError = fabsf(o.thetaDeg - targetTheta);
+  if (thetaStage || !o.phiDefined) return thetaError;
+  float phiError = phiErrorDeg(o.phiDeg, targetPhi);
+  return phiError + CL_THETA_HOLD_WEIGHT * thetaError;
+}
+
+// Choose separate adaptive psi / omega test sizes from the current error.
+void chooseSearchSteps(float thetaError, float phiError, bool thetaStage,
+                       float &psiStep, float &omegaStep) {
+
+  // First stage: primarily get THETA close.
+  if (thetaStage) {
+    if (thetaError > 20.0f) {
+      psiStep = 5.0f;
+      omegaStep = 8.0f;
+    }
+    else if (thetaError > 7.0f) {
+      psiStep = 2.0f;
+      omegaStep = 4.0f;
+    }
+    else {
+      psiStep = 0.5f;
+      omegaStep = 1.0f;
+    }
+  }
+
+  // Second stage: THETA is close, now move toward PHI target.
+  else {
+    if (phiError > 60.0f) {
+      psiStep = 4.0f;
+      omegaStep = 15.0f;
+    }
+    else if (phiError > 25.0f) {
+      psiStep = 2.0f;
+      omegaStep = 8.0f;
+    }
+    else if (phiError > 10.0f) {
+      psiStep = 1.0f;
+      omegaStep = 4.0f;
+    }
+    else {
+      psiStep = 0.5f;
+      omegaStep = 1.5f;
+    }
+  }
+}
+
+bool isImmediateReversal(const SearchMove &m, const ClosedLoopMemory &mem) {
+  bool psiReverse = (m.dPsi != 0.0f && mem.lastDPsi != 0.0f && m.dPsi * mem.lastDPsi < 0.0f);
+  bool omegaReverse = (m.dOmega != 0.0f && mem.lastDOmega != 0.0f && m.dOmega * mem.lastDOmega < 0.0f);
+  return psiReverse || omegaReverse;
+}
+
+bool hasMeaningfulImprovement(float currentScore, float candidateScore, bool reversal) {
+  float required = max(CL_MIN_IMPROVEMENT_ABS, currentScore * CL_MIN_IMPROVEMENT_FRAC);
+  if (reversal) required += max(CL_MIN_IMPROVEMENT_ABS, currentScore * CL_REVERSAL_EXTRA_FRAC);
+  return candidateScore <= (currentScore - required);
+}
+
+// Move to target so final approach is consistent. This reduces belt/gear backlash effects.
 bool executeMoveWithConsistentApproach(float targetPsi, float targetOmega, float rpm) {
   if (!inRange(targetPsi) || !inRange(targetOmega)) return false;
 
   float prePsi = targetPsi - CL_APPROACH_MARGIN_DEG;
   float preOmega = targetOmega - CL_APPROACH_MARGIN_DEG;
-
   if (prePsi < MIN_ANGLE_DEG) prePsi = targetPsi + CL_APPROACH_MARGIN_DEG;
   if (preOmega < MIN_ANGLE_DEG) preOmega = targetOmega + CL_APPROACH_MARGIN_DEG;
-
-  // If a target is exactly at the upper limit, the lower pre-position is still valid.
   if (!inRange(prePsi)) prePsi = targetPsi;
   if (!inRange(preOmega)) preOmega = targetOmega;
 
-  // Always settle at a pre-position first, then make the final approach.
   if (fabsf(currentPsiDeg() - prePsi) > 0.02f ||
       fabsf(currentOmegaDeg() - preOmega) > 0.02f) {
     if (!executeMove(prePsi, preOmega, rpm)) return false;
     delay(CL_SETTLE_MS);
   }
-
   if (!executeMove(targetPsi, targetOmega, rpm)) return false;
   delay(CL_SETTLE_MS);
   return true;
 }
 
-// Each trial starts by returning to the same base point, then approaches the
-// candidate in the same way. This avoids comparing measurements reached through
-// different backlash paths.
 bool tryCandidateFromBase(float basePsi, float baseOmega,
                           float candidatePsi, float candidateOmega,
                           float rpm, float targetTheta, float targetPhi,
-                          bool thetaStage, float &scoreOut) {
+                          bool thetaStage, float &scoreOut,
+                          HallOrientation &measurementOut) {
   if (!inRange(candidatePsi) || !inRange(candidateOmega)) return false;
-
   if (!executeMoveWithConsistentApproach(basePsi, baseOmega, rpm)) return false;
   if (!executeMoveWithConsistentApproach(candidatePsi, candidateOmega, rpm)) return false;
-
-  HallOrientation o = calculateThetaPhi(readFieldVector());
-  if (!o.valid) return false;
-
-  float thetaError = fabsf(o.thetaDeg - targetTheta);
-  if (thetaStage || !o.phiDefined) {
-    scoreOut = thetaError;
-  } else {
-    float phiError = phiErrorDeg(o.phiDeg, targetPhi);
-    scoreOut = phiError + CL_THETA_HOLD_WEIGHT * thetaError;
-  }
+  if (!readStableOrientation(measurementOut)) return false;
+  scoreOut = closedLoopScore(measurementOut, targetTheta, targetPhi, thetaStage);
   return true;
 }
 
@@ -741,90 +846,109 @@ bool closedLoopOrient(float targetTheta, float targetPhi, bool targetPhiDefined,
   }
   if (targetPhiDefined) targetPhi = wrap360(targetPhi);
 
+  ClosedLoopMemory memory = {0.0f, 0.0f, 0};
+
   for (int iter = 1; iter <= CL_MAX_ITERATIONS; iter++) {
-    HallOrientation current = calculateThetaPhi(readFieldVector());
-    if (!current.valid) {
+    HallOrientation current;
+    if (!readStableOrientation(current)) {
       pushError(-311, F("Field too small"));
       return false;
     }
 
-    float displayError = targetPhiDefined ? orientationError(current, targetTheta, targetPhi)
-                                           : fabsf(current.thetaDeg - targetTheta);
     float thetaError = fabsf(current.thetaDeg - targetTheta);
     bool phiNeeded = targetPhiDefined && !(targetTheta < PHI_UNDEFINED_THETA_DEG ||
                                            targetTheta > 180.0f - PHI_UNDEFINED_THETA_DEG);
     bool thetaStage = (thetaError > CL_THETA_STAGE2_BAND_DEG) || !phiNeeded || !current.phiDefined;
+    float currentScore = closedLoopScore(current, targetTheta, targetPhi, thetaStage);
 
     Serial.print(F("CL,ITER,")); Serial.print(iter);
     Serial.print(F(",STAGE,")); Serial.print(thetaStage ? F("THETA") : F("PHI"));
     Serial.print(F(",THETA,")); Serial.print(current.thetaDeg, 2);
     Serial.print(F(",PHI,"));
     if (current.phiDefined) Serial.print(current.phiDeg, 2); else Serial.print(F("UNDEFINED"));
-    Serial.print(F(",ERR,")); Serial.println(displayError, 2);
+    Serial.print(F(",SCORE,")); Serial.println(currentScore, 3);
 
     if (orientationAtTarget(current, targetTheta, targetPhi, targetPhiDefined)) {
       Serial.println(F("CL,OK"));
       return true;
     }
 
+    float psiStep, omegaStep;
+    float phiError = targetPhiDefined
+      ? phiErrorDeg(current.phiDeg, targetPhi)
+      : 0.0f;
+
+    chooseSearchSteps(thetaError, phiError, thetaStage, psiStep, omegaStep);
     float basePsi = currentPsiDeg();
     float baseOmega = currentOmegaDeg();
-    float bestPsi = basePsi;
-    float bestOmega = baseOmega;
-    float bestScore = thetaStage ? thetaError :
-      (current.phiDefined ? phiErrorDeg(current.phiDeg, targetPhi) + CL_THETA_HOLD_WEIGHT * thetaError : thetaError);
 
-    // Stage 1: PSI usually changes THETA the most, but OMEGA can also
-    // change THETA a little in the real mechanism. Therefore theta-only
-    // mode tests both axes before declaring that it is stuck.
-    // Stage 2: OMEGA remains the main PHI adjustment axis.
-    const int candidateCount = thetaStage ? 4 : 2;
-    float deltaPsi[4];
-    float deltaOmega[4];
-    if (thetaStage) {
-      // Try PSI +/-, then OMEGA +/- while scoring ONLY theta error.
-      deltaPsi[0] =  CL_PSI_NUDGE_DEG;  deltaOmega[0] = 0.0f;
-      deltaPsi[1] = -CL_PSI_NUDGE_DEG;  deltaOmega[1] = 0.0f;
-      deltaPsi[2] = 0.0f;               deltaOmega[2] =  CL_OMEGA_NUDGE_DEG;
-      deltaPsi[3] = 0.0f;               deltaOmega[3] = -CL_OMEGA_NUDGE_DEG;
-    } else {
-      deltaPsi[0] = 0.0f;               deltaOmega[0] =  CL_OMEGA_NUDGE_DEG;
-      deltaPsi[1] = 0.0f;               deltaOmega[1] = -CL_OMEGA_NUDGE_DEG;
-      deltaPsi[2] = 0.0f;               deltaOmega[2] = 0.0f;
-      deltaPsi[3] = 0.0f;               deltaOmega[3] = 0.0f;
-    }
+    // Cross search: four nearby candidates. Diagonals are tried only if no cross move wins.
+    SearchMove cross[4] = {
+      { psiStep, 0.0f }, { -psiStep, 0.0f },
+      { 0.0f, omegaStep }, { 0.0f, -omegaStep }
+    };
+    SearchMove diagonals[4] = {
+      { psiStep, omegaStep }, { psiStep, -omegaStep },
+      { -psiStep, omegaStep }, { -psiStep, -omegaStep }
+    };
 
-    for (int i = 0; i < candidateCount; i++) {
-      float cPsi = basePsi + deltaPsi[i];
-      float cOmega = baseOmega + deltaOmega[i];
-      float candidateScore;
+    SearchMove bestMove = {0.0f, 0.0f};
+    float bestScore = currentScore;
+    bool foundImprovement = false;
 
-      if (!tryCandidateFromBase(basePsi, baseOmega, cPsi, cOmega, rpm,
-                                targetTheta, targetPhi, thetaStage, candidateScore)) {
-        continue;
+    for (int pass = 0; pass < 2 && !foundImprovement; pass++) {
+      SearchMove *moves = (pass == 0) ? cross : diagonals;
+      int moveCount = 4;
+      for (int i = 0; i < moveCount; i++) {
+        float cPsi = basePsi + moves[i].dPsi;
+        float cOmega = baseOmega + moves[i].dOmega;
+        HallOrientation tested;
+        float candidateScore;
+        if (!tryCandidateFromBase(basePsi, baseOmega, cPsi, cOmega, rpm,
+                                  targetTheta, targetPhi, thetaStage,
+                                  candidateScore, tested)) continue;
+
+        bool reversal = isImmediateReversal(moves[i], memory);
+        Serial.print(F("CL,TRY,PSI,")); Serial.print(cPsi, 2);
+        Serial.print(F(",OMEGA,")); Serial.print(cOmega, 2);
+        Serial.print(F(",THETA,")); Serial.print(tested.thetaDeg, 2);
+        Serial.print(F(",PHI,"));
+        if (tested.phiDefined) Serial.print(tested.phiDeg, 2); else Serial.print(F("UNDEFINED"));
+        Serial.print(F(",SCORE,")); Serial.print(candidateScore, 3);
+        Serial.print(F(",REV,")); Serial.println(reversal ? 1 : 0);
+
+        if (candidateScore < bestScore &&
+            hasMeaningfulImprovement(currentScore, candidateScore, reversal)) {
+          bestScore = candidateScore;
+          bestMove = moves[i];
+          foundImprovement = true;
+        }
       }
+    }
 
-      Serial.print(F("CL,TRY,PSI,")); Serial.print(cPsi, 2);
-      Serial.print(F(",OMEGA,")); Serial.print(cOmega, 2);
-      Serial.print(F(",SCORE,")); Serial.println(candidateScore, 2);
-
-      if (candidateScore < bestScore) {
-        bestScore = candidateScore;
-        bestPsi = cPsi;
-        bestOmega = cOmega;
+    if (!foundImprovement) {
+      // Return to baseline before deciding whether to shrink step size / stop.
+      if (!executeMoveWithConsistentApproach(basePsi, baseOmega, rpm)) return false;
+      memory.noImproveCount++;
+      Serial.print(F("CL,NO_IMPROVE,")); Serial.println(memory.noImproveCount);
+      if (memory.noImproveCount >= CL_STUCK_LIMIT) {
+        pushError(-312, F("No meaningful improvement"));
+        Serial.println(F("CL,STALLED"));
+        return false;
       }
+      continue;
     }
 
-    // Return to the selected best point using the same final approach.
-    if (!executeMoveWithConsistentApproach(bestPsi, bestOmega, rpm)) return false;
+    memory.noImproveCount = 0;
+    float targetPsi = basePsi + bestMove.dPsi;
+    float targetOmega = baseOmega + bestMove.dOmega;
+    if (!executeMoveWithConsistentApproach(targetPsi, targetOmega, rpm)) return false;
+    memory.lastDPsi = bestMove.dPsi;
+    memory.lastDOmega = bestMove.dOmega;
 
-    // A tiny measurement change can look like improvement. Stop instead of
-    // endlessly hunting when neither candidate meaningfully improves.
-    if (bestPsi == basePsi && bestOmega == baseOmega) {
-      pushError(-312, F("No improving nudge"));
-      Serial.println(F("CL,STALLED"));
-      return false;
-    }
+    Serial.print(F("CL,ACCEPT,PSI,")); Serial.print(targetPsi, 2);
+    Serial.print(F(",OMEGA,")); Serial.print(targetOmega, 2);
+    Serial.print(F(",SCORE,")); Serial.println(bestScore, 3);
   }
 
   pushError(-313, F("Closed loop timeout"));
