@@ -21,7 +21,8 @@ const int HALL_X_PIN = A0;
 const int HALL_Y_PIN = A1;
 const int HALL_Z_PIN = A2;
 
-const int NUM_SAMPLES = 100;
+const uint8_t NUM_SAMPLES = 48;
+const uint8_t HALL_SAMPLE_DELAY_MS = 2;
 
 const float X_OFFSET = 502.57f;
 const float Y_OFFSET = 505.000;
@@ -41,12 +42,6 @@ struct FieldVector {
   float z;
 };
 
-struct HallPsiOmega {
-  float psiDeg;
-  float omegaDeg;
-  float magnitude;
-  bool valid;
-};
 
 struct HallOrientation {
   float thetaDeg;
@@ -75,16 +70,7 @@ struct SavedJacobian {
 
 // These must be declared near the top because the Arduino IDE auto-generates
 // function prototypes before later code sections.
-struct SearchMove {
-  float dPsi;
-  float dOmega;
-};
 
-struct ClosedLoopMemory {
-  float lastDPsi;
-  float lastDOmega;
-  int noImproveCount;
-};
 
 // -------------------- Forward Declarations --------------------
 float currentPsiDeg();
@@ -102,7 +88,7 @@ HallData readHallAverage() {
     xSum += analogRead(HALL_X_PIN);
     ySum += analogRead(HALL_Y_PIN);
     zSum += analogRead(HALL_Z_PIN);
-    delay(5);
+    delay(HALL_SAMPLE_DELAY_MS);
   }
   HallData result;
   result.x = ((float)xSum / NUM_SAMPLES) - X_OFFSET;
@@ -126,14 +112,6 @@ const float HALL_X_SCALE = 1.0f;
 const float HALL_Y_SCALE = 1.0f;
 const float HALL_Z_SCALE = 1.0f;
 
-const float ZERO_REF_X = -11.170f;
-const float ZERO_REF_Y = 4.670f;
-const float ZERO_REF_Z = 26.870f;
-// NOTE: ZERO_REF is no longer used for THETA/PHI. It remains only for old
-// helper code retained in this file; it can be removed during later cleanup.
-
-const float HALL_PSI_SIGN   = 1.0f;
-const float HALL_OMEGA_SIGN = 1.0f;
 
 float vectorMagnitude(const FieldVector &v) {
   return sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
@@ -145,41 +123,6 @@ FieldVector normalizeVector(const FieldVector &v) {
   return {v.x / m, v.y / m, v.z / m};
 }
 
-FieldVector crossProduct(const FieldVector &a, const FieldVector &b) {
-  return {
-    a.y*b.z - a.z*b.y,
-    a.z*b.x - a.x*b.z,
-    a.x*b.y - a.y*b.x
-  };
-}
-
-float dotProduct(const FieldVector &a, const FieldVector &b) {
-  return a.x*b.x + a.y*b.y + a.z*b.z;
-}
-
-FieldVector alignToZeroReference(const FieldVector &v) {
-  FieldVector u = normalizeVector({ZERO_REF_X, ZERO_REF_Y, ZERO_REF_Z});
-  FieldVector target = {0.0f, 0.0f, 1.0f};
-  float d = dotProduct(u, target);
-  if (d > 0.999999f) return v;
-  if (d < -0.999999f) return {v.x, -v.y, -v.z};
-
-  FieldVector axis = crossProduct(u, target);
-  float s = vectorMagnitude(axis);
-  axis.x /= s; axis.y /= s; axis.z /= s;
-
-  FieldVector axv = crossProduct(axis, v);
-  float adv = dotProduct(axis, v);
-  return {
-    v.x*d + axv.x*s + axis.x*adv*(1.0f-d),
-    v.y*d + axv.y*s + axis.y*adv*(1.0f-d),
-    v.z*d + axv.z*s + axis.z*adv*(1.0f-d)
-  };
-}
-
-float angularDifferenceDeg(float a, float b) {
-  return fabsf(wrapSigned180(a - b));
-}
 
 // -------------------- Hall Vector -> Theta/Phi --------------------
 // THETA/PHI are measured directly in the Hall/sample coordinate frame.
@@ -197,7 +140,6 @@ HallOrientation calculateThetaPhi(const FieldVector &rawB) {
   out.valid = false;
   if (out.magnitude < 0.001f) return out;
 
-  // Do NOT rotate by ZERO_REF here. ZERO_REF would redefine THETA = 0.
   // Use the Hall/sample axes directly.
   FieldVector b = normalizeVector(rawB);
   float z = constrain(b.z, -1.0f, 1.0f);
@@ -215,55 +157,6 @@ HallOrientation calculateThetaPhi(const FieldVector &rawB) {
 
 float phiErrorDeg(float actualPhiDeg, float targetPhiDeg) {
   return fabsf(wrapSigned180(actualPhiDeg - targetPhiDeg));
-}
-
-// Combined orientation error used only by the closed-loop search.
-// Phi is naturally ignored near theta = 0 or 180 because the in-plane direction is undefined there.
-float orientationError(const HallOrientation &o, float targetThetaDeg, float targetPhiDeg) {
-  float thetaError = fabsf(o.thetaDeg - targetThetaDeg);
-  if (!o.phiDefined || targetThetaDeg < PHI_UNDEFINED_THETA_DEG ||
-      targetThetaDeg > (180.0f - PHI_UNDEFINED_THETA_DEG)) {
-    return thetaError;
-  }
-  float phiWeight = sinf(targetThetaDeg * PI / 180.0f);
-  return thetaError + phiWeight * phiErrorDeg(o.phiDeg, targetPhiDeg);
-}
-
-HallPsiOmega calculateHallPsiOmega(const FieldVector &rawB) {
-  HallPsiOmega out;
-  out.magnitude = vectorMagnitude(rawB);
-  out.psiDeg = 0.0f;
-  out.omegaDeg = 0.0f;
-  out.valid = false;
-  if (out.magnitude < 0.001f) return out;
-
-  FieldVector unitB = normalizeVector(rawB);
-  FieldVector b = alignToZeroReference(unitB);
-
-  float psi1 = atan2f(b.x, sqrtf(b.y*b.y + b.z*b.z)) * 180.0f / PI;
-  float omega1 = atan2f(b.y, b.z) * 180.0f / PI;
-  psi1 *= HALL_PSI_SIGN;
-  omega1 *= HALL_OMEGA_SIGN;
-  psi1 = wrapSigned180(psi1);
-  omega1 = wrapSigned180(omega1);
-
-  float psi2 = (psi1 >= 0.0f) ? (180.0f - psi1) : (-180.0f - psi1);
-  float omega2 = wrapSigned180(omega1 + 180.0f);
-
-  float motorPsi = currentPsiDeg();
-  float motorOmega = currentOmegaDeg();
-  float score1 = angularDifferenceDeg(psi1, motorPsi) + angularDifferenceDeg(omega1, motorOmega);
-  float score2 = angularDifferenceDeg(psi2, motorPsi) + angularDifferenceDeg(omega2, motorOmega);
-
-  if (score2 < score1) {
-    out.psiDeg = psi2;
-    out.omegaDeg = omega2;
-  } else {
-    out.psiDeg = psi1;
-    out.omegaDeg = omega1;
-  }
-  out.valid = true;
-  return out;
 }
 
 // -------------------- Motor Settings --------------------
@@ -366,8 +259,8 @@ void clearSavedJacobian() {
 }
 
 // -------------------- SCPI Error Queue --------------------
-const int ERROR_QUEUE_SIZE  = 8;
-const int ERROR_ENTRY_LEN   = 48;
+const int ERROR_QUEUE_SIZE  = 4;
+const int ERROR_ENTRY_LEN   = 32;
 
 static char errorQueue[ERROR_QUEUE_SIZE][ERROR_ENTRY_LEN];
 static int  errorHead  = 0;
@@ -462,7 +355,6 @@ void sendHallData() {
   Serial.print(F(",PHI,"));
   if (o.phiDefined) Serial.print(o.phiDeg, 2);
   else              Serial.print(F("UNDEFINED"));
-  // HALL_PSI/HALL_OMEGA intentionally omitted: they are not real motor angles.
   Serial.print(F(",MOTOR_PSI,"));  Serial.print(signed180ToUser360(currentPsiDeg()), 2);
   Serial.print(F(",MOTOR_OMEGA,")); Serial.println(signed180ToUser360(currentOmegaDeg()), 2);
 }
@@ -719,6 +611,9 @@ void moveAndMeasure(float psi, float omega, float rpm) {
 // fast large moves when far away and smaller verified moves near the target.
 
 const float CL_THETA_TOL_DEG = 2.0f;
+// Near a theta pole, Hall-angle repeatability is about 2-3 degrees.
+// Use this relaxed tolerance only for theta-only commands such as 0,UNDEF.
+const float CL_THETA_ONLY_TOL_DEG = 6.0f;
 const float CL_PHI_TOL_DEG = 5.0f;
 const float CL_THETA_WEIGHT = 2.5f;
 const float CL_PHI_WEIGHT = 1.0f;
@@ -733,8 +628,6 @@ const float CL_MIN_IMPROVEMENT_FRAC = 0.015f;
 // Jacobian learning is deliberately conservative. Large moves traverse a
 // nonlinear mechanism, so they are used for motion but not for model learning.
 const float CL_MODEL_LEARNING_RATE = 0.12f;
-const float CL_MAX_LEARNING_PSI_DEG = 4.0f;
-const float CL_MAX_LEARNING_OMEGA_DEG = 6.0f;
 const float CL_MIN_SLOPE_MAG = 0.10f;
 
 // Phi is mathematically ill-conditioned near theta = 0 or 180.
@@ -746,14 +639,23 @@ const float CL_PHI_ENABLE_THETA_DEG = 20.0f;
 const int CL_MAX_REJECTS_BEFORE_RESET = 2;
 const float CL_MIN_REJECTION_SCALE = 0.20f;
 
-// When the shortest PHI direction would drive OMEGA beyond its wire-protection
-// limit, try the other wrapped PHI direction instead. This can be a longer
-// physical field path, but it keeps the motors inside their safe range.
-const float CL_LIMIT_MARGIN_DEG = 1.0f;
+// Closed-loop moves stay inside this conservative omega workspace. The reset
+// occurred near +155 degrees, so normal corrections never enter that region.
+const float CL_LIMIT_MARGIN_DEG = 3.0f;
+const float CL_OMEGA_SAFE_LIMIT_DEG = 140.0f;
 
-// Limit-aware look-ahead planner. This is used before a motor limit is hit.
-// It trades a little extra travel for a path that remains smooth and preserves
-// clearance from both wire-protection boundaries.
+// When the normal path would exceed the protected omega workspace, transfer
+// through the real mechanical center to the opposite safe branch. This is NOT
+// a coordinate wrap: omega moves continuously in small stages through zero.
+const float CL_TRANSFER_TRIGGER_DEG = 115.0f;
+const float CL_TRANSFER_OPPOSITE_OMEGA_DEG = 110.0f;
+const float CL_TRANSFER_STAGE_DEG = 15.0f;
+const float CL_TRANSFER_MAX_RPM = 2.0f;
+const unsigned long CL_TRANSFER_SETTLE_MS = 200UL;
+
+// After repeated rejected two-axis predictions, make at most one small direct
+// omega nudge. There is no six-candidate route search and no automatic wrap.
+const float CL_PHI_NUDGE_STEP_DEG = 5.0f;
 
 struct LocalJacobian {
   // [ dTheta/dPsi  dTheta/dOmega ]
@@ -775,7 +677,11 @@ bool thetaSafelyAwayFromPole(float thetaDeg) {
 
 bool orientationAtTarget(const HallOrientation &o, float targetThetaDeg,
                          float targetPhiDeg, bool targetPhiDefined) {
-  if (fabsf(o.thetaDeg - targetThetaDeg) > CL_THETA_TOL_DEG) return false;
+  // Theta-only pole commands have a practical repeatability floor of roughly
+  // 2-3 degrees. Stop cleanly instead of hunting around the undefined-phi pole.
+  const float thetaTolerance = !targetPhiDefined ? CL_THETA_ONLY_TOL_DEG
+                                                  : CL_THETA_TOL_DEG;
+  if (fabsf(o.thetaDeg - targetThetaDeg) > thetaTolerance) return false;
 
   // For a pole target, phi is not meaningful. For non-pole targets, require
   // a reliable measured phi before declaring success.
@@ -838,14 +744,53 @@ float keepNonZeroSlope(float value) {
 // Keep them as easy-to-tune constants rather than storing a large lookup table.
 const bool  CL_ENABLE_INITIAL_COARSE = true;
 const float CL_COARSE_START_SCORE = 35.0f;
-const float CL_COARSE_PSI_PER_THETA = -0.90f;
-const float CL_COARSE_OMEGA_PER_PHI = -1.95f;
 const float CL_COARSE_FRACTION = 0.88f;
 const float CL_COARSE_LIMIT_MARGIN = 4.0f;
 
 float clampCoarseTarget(float x) {
   return constrain(x, MIN_ANGLE_DEG + CL_COARSE_LIMIT_MARGIN,
                      MAX_ANGLE_DEG - CL_COARSE_LIMIT_MARGIN);
+}
+
+bool closedLoopTargetSafe(float psi, float omega) {
+  return psi >= (MIN_ANGLE_DEG + CL_LIMIT_MARGIN_DEG) &&
+         psi <= (MAX_ANGLE_DEG - CL_LIMIT_MARGIN_DEG) &&
+         fabsf(omega) <= CL_OMEGA_SAFE_LIMIT_DEG;
+}
+
+// Move omega continuously through zero to the opposite safe branch. PSI is
+// held fixed, so the transfer is physically staged rather than a fake +180/-180
+// coordinate jump. This is used only once per CL:ORIENT command.
+bool runSafeOmegaTransfer(float psi, float startOmega, float rpm) {
+  float targetOmega = (startOmega >= 0.0f) ? -CL_TRANSFER_OPPOSITE_OMEGA_DEG
+                                            :  CL_TRANSFER_OPPOSITE_OMEGA_DEG;
+  if (!closedLoopTargetSafe(psi, targetOmega)) return false;
+
+  float transferRPM = (rpm < CL_TRANSFER_MAX_RPM) ? rpm : CL_TRANSFER_MAX_RPM;
+  if (transferRPM <= 0.0f) return false;
+
+  Serial.print(F("CL,OMEGA_TRANSFER,FROM,")); Serial.print(startOmega, 2);
+  Serial.print(F(",TO,")); Serial.println(targetOmega, 2);
+
+  float omega = startOmega;
+  while (fabsf(targetOmega - omega) > 0.25f) {
+    float remaining = targetOmega - omega;
+    float step = constrain(remaining, -CL_TRANSFER_STAGE_DEG, CL_TRANSFER_STAGE_DEG);
+    float nextOmega = omega + step;
+
+    if (!closedLoopTargetSafe(psi, nextOmega) ||
+        !executeMove(psi, nextOmega, transferRPM)) {
+      pushError(-320, F("Omega transfer failed"));
+      Serial.println(F("CL,OMEGA_TRANSFER,FAIL"));
+      return false;
+    }
+
+    delay(CL_TRANSFER_SETTLE_MS);
+    omega = currentOmegaDeg();
+  }
+
+  Serial.println(F("CL,OMEGA_TRANSFER,OK"));
+  return true;
 }
 
 // Relative coarse move: calculate from the current Hall orientation rather than
@@ -885,6 +830,15 @@ bool runInitialCoarseApproach(const HallOrientation &current, float targetTheta,
   // Theta-only moves can make a much larger safe coarse psi jump.
   dPsi = constrain(dPsi * CL_COARSE_FRACTION, -35.0f, 35.0f);
   dOmega = 0.0f;
+
+  // Departing a pole toward a full theta/phi target: phi is unreliable at the
+  // pole, but leaving omega parked far from center can trap the next phi
+  // correction on the wrong side of the 0/360 wrap. Recenter omega first.
+  if (targetPhiDefined && !thetaSafelyAwayFromPole(current.thetaDeg)) {
+    if (curOmega > 20.0f) dOmega = -min(25.0f, curOmega);
+    else if (curOmega < -20.0f) dOmega = min(25.0f, -curOmega);
+    if (dOmega != 0.0f) Serial.println(F("CL,POLE_DEPART,RECENTER_OMEGA"));
+  }
   } else {
     // Two-axis moves stay more conservative.
     dPsi = constrain(dPsi * CL_COARSE_FRACTION, -12.0f, 12.0f);
@@ -892,7 +846,11 @@ bool runInitialCoarseApproach(const HallOrientation &current, float targetTheta,
   }
 
   float nextPsi = clampCoarseTarget(curPsi + dPsi);
-  float nextOmega = clampCoarseTarget(curOmega + dOmega);
+  float nextOmega = curOmega + dOmega;
+  if (!closedLoopTargetSafe(nextPsi, nextOmega)) {
+    Serial.println(F("CL,COARSE_LIMIT"));
+    return false;
+  }
   if (fabsf(nextPsi - curPsi) < 0.5f && fabsf(nextOmega - curOmega) < 0.5f) return false;
 
   Serial.print(F("CL,COARSE_REL,PSI,")); Serial.print(nextPsi, 2);
@@ -913,8 +871,11 @@ void selectMotionLimits(float score, bool poleMode,
     } else {
       damping = 0.45f; maxPsi = 2.0f; maxOmega = 0.0f;
     }
+  } else if (score > 100.0f) {
+    // Far from target: fast direct Jacobian corrections.
+    damping = 0.95f; maxPsi = 15.0f; maxOmega = 25.0f;
   } else if (score > 35.0f) {
-    damping = 0.80f; maxPsi = 8.0f; maxOmega = 15.0f;
+    damping = 0.85f; maxPsi = 10.0f; maxOmega = 18.0f;
   } else if (score > 12.0f) {
     damping = 0.55f; maxPsi = 4.0f; maxOmega = 8.0f;
   } else {
@@ -950,12 +911,10 @@ void sendJacobianQuery() {
   printModel();
 }
 
-// Predict a motor correction from the inverse local Jacobian.
-// phiErrorOverride is normally NaN. When supplied, it lets the caller use the
-// other 360-degree PHI branch if the shortest branch would violate a motor limit.
-bool predictCorrectionWithPhiError(const HallOrientation &o, float targetTheta, float targetPhi,
-                                   bool phiNeeded, float score, float phiErrorOverride,
-                                   float &dPsi, float &dOmega) {
+// Predict one normal correction from the inverse local Jacobian. Phi always uses
+// the ordinary signed 180-degree error; no alternate wrap branch is available.
+bool predictCorrection(const HallOrientation &o, float targetTheta, float targetPhi,
+                       bool phiNeeded, float score, float &dPsi, float &dOmega) {
   float eTheta = targetTheta - o.thetaDeg;
   bool poleMode = !phiNeeded || !o.phiDefined;
   float damping, maxPsi, maxOmega;
@@ -965,28 +924,18 @@ bool predictCorrectionWithPhiError(const HallOrientation &o, float targetTheta, 
     dPsi = eTheta / keepNonZeroSlope(clModel.a);
     dOmega = 0.0f;
   } else {
-    float ePhi = isnan(phiErrorOverride) ? signedPhiDifference(targetPhi, o.phiDeg)
-                                          : phiErrorOverride;
+    float ePhi = signedPhiDifference(targetPhi, o.phiDeg);
     float det = clModel.a * clModel.d - clModel.b * clModel.c;
     if (fabsf(det) < 0.08f) return false;
     dPsi = ( clModel.d * eTheta - clModel.b * ePhi) / det;
     dOmega = (-clModel.c * eTheta + clModel.a * ePhi) / det;
   }
 
-  dPsi *= damping;
-  dOmega *= damping;
-  dPsi = constrain(dPsi, -maxPsi, maxPsi);
-  dOmega = constrain(dOmega, -maxOmega, maxOmega);
-
+  dPsi = constrain(dPsi * damping, -maxPsi, maxPsi);
+  dOmega = constrain(dOmega * damping, -maxOmega, maxOmega);
   if (fabsf(dPsi) < 0.20f) dPsi = 0.0f;
   if (fabsf(dOmega) < 0.35f) dOmega = 0.0f;
-  return (dPsi != 0.0f || dOmega != 0.0f);
-}
-
-bool predictCorrection(const HallOrientation &o, float targetTheta, float targetPhi,
-                       bool phiNeeded, float score, float &dPsi, float &dOmega) {
-  return predictCorrectionWithPhiError(o, targetTheta, targetPhi, phiNeeded, score, NAN,
-                                       dPsi, dOmega);
+  return dPsi != 0.0f || dOmega != 0.0f;
 }
 
 // Learn from verified motions. Large moves are down-weighted; THETA is still
@@ -999,10 +948,7 @@ void updateModel(const HallOrientation &before, const HallOrientation &after,
   // Do not let pole behavior overwrite the general middle-region Jacobian.
   // The controller can still move near the pole; it just does not learn there.
   if (!thetaSafelyAwayFromPole(before.thetaDeg) ||
-      !thetaSafelyAwayFromPole(after.thetaDeg)) {
-    Serial.println(F("CL,MODEL_SKIP,POLE_REGION"));
-    return;
-  }
+      !thetaSafelyAwayFromPole(after.thetaDeg)) return;
 
   // Big moves still contain useful information, but they cross more nonlinear
   // parts of the mechanism. Learn from them at reduced weight rather than
@@ -1053,54 +999,6 @@ bool readPostMoveOrientation(HallOrientation &out, float targetTheta, float targ
   return true;
 }
 
-bool runFallbackCrossSearch(const HallOrientation &baseMeasure, float basePsi, float baseOmega,
-                            float targetTheta, float targetPhi, bool phiNeeded, float rpm,
-                            float &acceptedDPsi, float &acceptedDOmega) {
-  float thetaError = fabsf(baseMeasure.thetaDeg - targetTheta);
-  float phiError = phiNeeded ? phiErrorDeg(baseMeasure.phiDeg, targetPhi) : 0.0f;
-  float psiStep = (thetaError > 8.0f) ? 3.0f : 1.0f;
-  float omegaStep = !phiNeeded ? 0.0f : ((phiError > 15.0f) ? 8.0f : 3.0f);
-  float baseScore = closedLoopScore(baseMeasure, targetTheta, targetPhi, phiNeeded);
-  float bestScore = baseScore;
-  acceptedDPsi = acceptedDOmega = 0.0f;
-  SearchMove moves[8] = {
-    { psiStep, 0}, {-psiStep, 0},
-    { 0, omegaStep}, {0, -omegaStep},
-    { psiStep, omegaStep}, {psiStep, -omegaStep},
-    {-psiStep, omegaStep}, {-psiStep, -omegaStep}
-  };
-
-  for (int i = 0; i < 8; i++) {
-    if (moves[i].dPsi == 0.0f && moves[i].dOmega == 0.0f) continue;
-    float p = basePsi + moves[i].dPsi;
-    float w = baseOmega + moves[i].dOmega;
-    if (!inRange(p) || !inRange(w)) continue;
-    if (!executeMove(p, w, rpm)) continue;
-    delay(CL_SETTLE_MS);
-
-    HallOrientation trial;
-    if (!readStableOrientation(trial, CL_FAST_READS)) continue;
-    float s = closedLoopScore(trial, targetTheta, targetPhi, phiNeeded);
-    Serial.print(F("CL,FALLBACK,PSI,")); Serial.print(p,2);
-    Serial.print(F(",OMEGA,"));          Serial.print(w,2);
-    Serial.print(F(",THETA,"));          Serial.print(trial.thetaDeg,2);
-    Serial.print(F(",PHI,"));
-    if (trial.phiDefined) Serial.print(trial.phiDeg,2); else Serial.print(F("UNDEFINED"));
-    Serial.print(F(",SCORE,")); Serial.println(s,3);
-
-    if (s < bestScore) {
-      bestScore = s;
-      acceptedDPsi = moves[i].dPsi;
-      acceptedDOmega = moves[i].dOmega;
-    }
-    executeMove(basePsi, baseOmega, rpm);
-    delay(CL_SETTLE_MS);
-  }
-
-  return bestScore < baseScore - max(CL_MIN_IMPROVEMENT_ABS,
-                                     baseScore * CL_MIN_IMPROVEMENT_FRAC);
-}
-
 bool closedLoopOrient(float targetTheta, float targetPhi, bool targetPhiDefined, float rpm) {
   if (targetTheta < 0.0f || targetTheta > 180.0f || rpm <= 0.0f) {
     pushError(-310, F("Bad theta or RPM"));
@@ -1128,6 +1026,8 @@ bool closedLoopOrient(float targetTheta, float targetPhi, bool targetPhiDefined,
 
   float rejectionStepScale = 1.0f;
   int rejectedMoves = 0;
+  bool phiNudgeUsed = false;
+  bool omegaTransferUsed = false;
 
   for (int iter = 1; iter <= CL_MAX_ITERATIONS; iter++) {
     HallOrientation current;
@@ -1169,19 +1069,62 @@ bool closedLoopOrient(float targetTheta, float targetPhi, bool targetPhiDefined,
     float curOmega = currentOmegaDeg();
     bool predicted = predictCorrection(current, targetTheta, targetPhi, phiNeeded,
                                        score, dPsi, dOmega);
-    bool normalInRange = predicted && inRange(curPsi + dPsi) && inRange(curOmega + dOmega);
+    bool usePhiNudge = false;
 
-    // Keep the fast Jacobian path while it is safe. If it would cross a
-    // wire-protection limit, use the small physical fallback only then.
-    if (!normalInRange) {
-      Serial.println(F("CL,PREDICT_LIMIT,FALLBACK"));
-      if (!runFallbackCrossSearch(current, curPsi, curOmega,
-                                  targetTheta, targetPhi, phiNeeded, rpm,
-                                  dPsi, dOmega)) {
-        pushError(-312, F("Target blocked by motor limits"));
-        Serial.println(F("CL,STALLED,LIMIT"));
+    // No wrap escape and no multi-position route search. After two rejected
+    // predictions, make one small omega-only nudge in the measured phi direction.
+    if (targetPhiDefined && phiNeeded && rejectedMoves >= CL_MAX_REJECTS_BEFORE_RESET) {
+      if (!phiNudgeUsed) {
+        float ePhi = signedPhiDifference(targetPhi, current.phiDeg);
+        float phiSlope = keepNonZeroSlope(clModel.d);
+        dPsi = 0.0f;
+        dOmega = ((ePhi / phiSlope) >= 0.0f) ? CL_PHI_NUDGE_STEP_DEG
+                                              : -CL_PHI_NUDGE_STEP_DEG;
+        if (closedLoopTargetSafe(curPsi, curOmega + dOmega)) {
+          phiNudgeUsed = true;
+          usePhiNudge = true;
+          rejectionStepScale = 1.0f;
+          Serial.print(F("CL,PHI_NUDGE,DOMEGA,")); Serial.println(dOmega, 2);
+        }
+      }
+      if (!usePhiNudge) {
+        pushError(-318, F("Phi path blocked"));
+        Serial.println(F("CL,STALLED,OMEGA_LIMIT"));
         return false;
       }
+    }
+
+    // Theta-only commands do not run a six-position escape search either.
+    if (!targetPhiDefined && rejectedMoves >= CL_MAX_REJECTS_BEFORE_RESET) {
+      pushError(-319, F("Theta path stalled"));
+      Serial.println(F("CL,STALLED,THETA_PATH"));
+      return false;
+    }
+
+    // If the desired correction points outward through the protected omega
+    // boundary, unwind through zero to the opposite branch once, then re-read
+    // the Hall field and resume normal Jacobian control from that branch.
+    bool normalTargetSafe = predicted && closedLoopTargetSafe(curPsi + dPsi,
+                                                               curOmega + dOmega);
+    bool pointsOutward = (curOmega > 0.0f && dOmega > 0.0f) ||
+                         (curOmega < 0.0f && dOmega < 0.0f);
+    bool needsTransfer = !usePhiNudge && predicted && !normalTargetSafe &&
+                         targetPhiDefined && phiNeeded && !omegaTransferUsed &&
+                         fabsf(curOmega) >= CL_TRANSFER_TRIGGER_DEG && pointsOutward;
+
+    if (needsTransfer) {
+      if (!runSafeOmegaTransfer(curPsi, curOmega, rpm)) return false;
+      omegaTransferUsed = true;
+      rejectionStepScale = 1.0f;
+      rejectedMoves = 0;
+      phiNudgeUsed = false;
+      continue;
+    }
+
+    if (!usePhiNudge && !normalTargetSafe) {
+      pushError(-312, F("Target blocked by motor limits"));
+      Serial.println(F("CL,STALLED,OMEGA_LIMIT"));
+      return false;
     }
 
     // After a rejected move, retry with a smaller version of the prediction.
@@ -1230,7 +1173,7 @@ bool closedLoopOrient(float targetTheta, float targetPhi, bool targetPhiDefined,
         pushError(-317, F("Rollback failed"));
         return false;
       }
-      delay(CL_SETTLE_MS * 2UL);
+      delay(CL_SETTLE_MS);
 
       rejectionStepScale *= 0.5f;
       if (rejectionStepScale < CL_MIN_REJECTION_SCALE) {
@@ -1239,9 +1182,9 @@ bool closedLoopOrient(float targetTheta, float targetPhi, bool targetPhiDefined,
       rejectedMoves++;
 
       if (rejectedMoves >= CL_MAX_REJECTS_BEFORE_RESET) {
-        clModel = CL_MODEL_DEFAULT;
-        rejectedMoves = 0;
-        Serial.println(F("CL,MODEL_RESET,REPEATED_REJECTS"));
+        // Keep the learned model. A rejected move near a pole or motor limit
+        // should not erase a model that worked in the middle operating region.
+        Serial.println(F("CL,MODEL_HOLD,REPEATED_REJECTS"));
       }
       continue;
     }
@@ -1251,7 +1194,6 @@ bool closedLoopOrient(float targetTheta, float targetPhi, bool targetPhiDefined,
     rejectedMoves = 0;
 
     updateModel(current, after, dPsi, dOmega);
-    printModel();
   }
 
   pushError(-313, F("Closed loop timeout"));
@@ -1455,7 +1397,7 @@ void handleSCPI(char *line) {
     //   CL:ORIENT <theta>,<phi>,<rpm>     e.g. CL:ORIENT 115,27,2
     //   CL:ORIENT <theta>,UNDEF,<rpm>    e.g. CL:ORIENT 0,UNDEF,2
     // UNDEF means PHI is intentionally ignored; use it near THETA = 0 or 180.
-    char argBuf[80];
+    char argBuf[64];
     strncpy(argBuf, args, sizeof(argBuf) - 1);
     argBuf[sizeof(argBuf) - 1] = '\0';
 
@@ -1497,7 +1439,7 @@ void handleSCPI(char *line) {
 
 // -------------------- Serial Input --------------------
 void handleSerialInput() {
-  static char lineBuf[80];
+  static char lineBuf[64];
   static uint8_t pos = 0;
 
   while (Serial.available() > 0) {
@@ -1534,30 +1476,8 @@ void setup() {
   restorePositionFromEEPROM();
   if (loadSavedJacobian()) Serial.println(F("CAL,JAC,LOADED"));
 
-  Serial.println(F("Goniometer SCPI ready."));
-  Serial.println(F("User input angles for MOVE:ABS and MEAS:MOVE are 0 to 360 degrees."));
-  Serial.println(F("Internal motion logic remains -180 to 180 degrees."));
-  Serial.println(F("Examples:"));
-  Serial.println(F("*IDN?"));
-  Serial.println(F("STAT:POS?"));
-  Serial.println(F("STAT:STEP?"));
-  Serial.println(F("STAT:SWIT?"));
-  Serial.println(F("STAT:EEPR?"));
-  Serial.println(F("CONF:GZER?"));
-  Serial.println(F("CONF:HOM?"));
-  Serial.println(F("MEAS:FIELD?"));
-  Serial.println(F("HALL?"));
-  Serial.println(F("MOVE:ABS 270,350,5"));
-  Serial.println(F("MEAS:MOVE 270,350,5"));
-  Serial.println(F("CL:ORIENT 45,90,3   (target theta,phi,rpm)"));
-  Serial.println(F("CL:ORIENT 0,UNDEF,3 (theta-only; ignore phi)"));
-  Serial.println(F("Closed-loop uses relative coarse move and persistent Jacobian."));
-  Serial.println(F("MOVE:ZERO"));
-  Serial.println(F("HOME:OMEGA"));
-  Serial.println(F("HOME:PSI"));
-  Serial.println(F("MEM:CLEAR"));
-  Serial.println(F("CAL:JAC? / CAL:JAC:SAVE / CAL:JAC:LOAD / CAL:JAC:CLEAR"));
-  Serial.println(F("SYST:ERR?"));
+  Serial.println(F("Goniometer ready."));
+  Serial.println(F("CL:ORIENT theta,phi,rpm | HALL? | STAT:POS?"));
 }
 
 void loop() {
