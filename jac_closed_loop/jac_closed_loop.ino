@@ -640,17 +640,17 @@ void moveAndMeasure(float psi, float omega, float rpm) {
 const float CL_THETA_TOL_DEG = 2.0f;
 // Near a theta pole, phi is not meaningful and theta repeatability is worse.
 const float CL_THETA_ONLY_TOL_DEG = 6.0f;
-const float CL_PHI_TOL_DEG = 5.0f;
+const float CL_PHI_TOL_DEG = 4.0f;
 const float CL_THETA_WEIGHT = 2.5f;
 const float CL_PHI_WEIGHT = 1.0f;
 
 // Extra room is needed for a measured omega sweep and a possible alternate
 // branch transfer.  These are discrete move/measure iterations, not a
 // continuous servo loop.
-const int CL_MAX_ITERATIONS = 55;
+const int CL_MAX_ITERATIONS = 25;
 const unsigned long CL_SETTLE_MS = 450UL;
-const int CL_FAST_READS = 1;
-const int CL_VERIFY_READS = 3;
+const int CL_FAST_READS = 2;
+const int CL_VERIFY_READS = 5;
 
 // A very tiny score change is usually Hall noise rather than real progress.
 // Normal moves may still be accepted if they do not worsen the score, but
@@ -666,7 +666,7 @@ const float CL_MIN_SLOPE_MAG = 0.10f;
 
 // Phi is ill-conditioned near theta = 0 or 180.  Do not let it steer feedback
 // until both the target and measured field direction are far enough from a pole.
-const float CL_PHI_ENABLE_THETA_DEG = 20.0f;
+const float CL_PHI_ENABLE_THETA_DEG = 10.0f;
 
 // Normal prediction failures or stagnant moves trigger an empirical phi recovery
 // stage.  It tries the model-preferred omega sign first, then the opposite sign
@@ -1241,6 +1241,12 @@ bool closedLoopOrient(float targetTheta, float targetPhi, bool targetPhiDefined,
       if (readStableOrientation(verified, CL_VERIFY_READS) &&
           orientationAtTarget(verified, targetTheta, targetPhi,
                               targetPhiDefined)) {
+        Serial.print(F("CL,FINAL,THETA,"));
+        Serial.print(verified.thetaDeg, 2);
+        Serial.print(F(",PHI,"));
+        if (verified.phiDefined) Serial.print(verified.phiDeg, 2);
+        else Serial.print(F("UNDEFINED"));
+        Serial.println();
         Serial.println(F("CL,OK"));
         return true;
       }
